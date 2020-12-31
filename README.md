@@ -1,3 +1,6 @@
+This repository is a fork of [pymarl](https://github.com/oxwhirl/pymarl) framework.
+
+
 ```diff
 - Please pay attention to the version of SC2 you are using for your experiments. 
 - Performance is *not* always comparable between versions. 
