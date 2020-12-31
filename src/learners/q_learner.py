@@ -2,8 +2,11 @@ import copy
 from components.episode_buffer import EpisodeBatch
 from modules.mixers.vdn import VDNMixer
 from modules.mixers.qmix import QMixer
+from modules.mixers.qmixrainbow import QMixerRainbow
 import torch as th
-from torch.optim import RMSprop
+from torch.optim import RMSprop, Adam, lr_scheduler
+
+import numpy as np
 
 
 class QLearner:
@@ -22,19 +25,35 @@ class QLearner:
                 self.mixer = VDNMixer()
             elif args.mixer == "qmix":
                 self.mixer = QMixer(args)
+            elif args.mixer == "qmix_plus":
+                self.mixer = QMixerRainbow(args)
             else:
                 raise ValueError("Mixer {} not recognised.".format(args.mixer))
             self.params += list(self.mixer.parameters())
             self.target_mixer = copy.deepcopy(self.mixer)
 
-        self.optimiser = RMSprop(params=self.params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
+        lr = args.initial_lr if args.use_decay else args.lr
+        if args.optimizer == 'rmsprop':
+            self.optimiser = RMSprop(params=self.params, lr=lr, alpha=args.optim_alpha, eps=args.optim_eps,
+                                     weight_decay=args.regularization)
+        elif args.optimizer == 'adam':
+            self.optimiser = Adam(params=self.params, lr=lr, eps=args.optim_eps, weight_decay=args.regularization)
+        else:
+            raise ValueError("Optimizer {} not recognized".format(args.optimizer))
+
+        if args.use_decay:
+            # Decay after reaching episode number (1 episode ~ 50 timesteps)
+            self.scheduler = lr_scheduler.MultiStepLR(self.optimiser, milestones=[4000, 10000, 180000],
+                                                      gamma=args.lr_decay_gamma)
 
         # a little wasteful to deepcopy (e.g. duplicates action selector), but should work for any MAC
         self.target_mac = copy.deepcopy(mac)
 
         self.log_stats_t = -self.args.learner_log_interval - 1
 
-    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, weights=None):
+        n_steps = self.args.n_steps
+
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
@@ -57,22 +76,22 @@ class QLearner:
         # Calculate the Q-Values necessary for the target
         target_mac_out = []
         self.target_mac.init_hidden(batch.batch_size)
-        for t in range(batch.max_seq_length):
+        for t in range(n_steps, batch.max_seq_length):
             target_agent_outs = self.target_mac.forward(batch, t=t)
             target_mac_out.append(target_agent_outs)
 
-        # We don't need the first timesteps Q-Value estimate for calculating targets
-        target_mac_out = th.stack(target_mac_out[1:], dim=1)  # Concat across time
-
+        # Only need target q predictions n steps in the future
+        target_mac_out = th.stack(target_mac_out, dim=1)  # Concat across time
+        # (Batch, t-n, n_agents, n_actions)
         # Mask out unavailable actions
-        target_mac_out[avail_actions[:, 1:] == 0] = -9999999
+        target_mac_out[avail_actions[:, n_steps:] == 0] = -9999999
 
         # Max over target Q-Values
         if self.args.double_q:
             # Get actions that maximise live Q (for double q-learning)
             mac_out_detach = mac_out.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
-            cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1]
+            cur_max_actions = mac_out_detach[:, n_steps:].max(dim=3, keepdim=True)[1]
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
         else:
             target_max_qvals = target_mac_out.max(dim=3)[0]
@@ -80,10 +99,33 @@ class QLearner:
         # Mix
         if self.mixer is not None:
             chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
-            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
+            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, n_steps:])
 
-        # Calculate 1-step Q-Learning targets
-        targets = rewards + self.args.gamma * (1 - terminated) * target_max_qvals
+        if n_steps > 1:
+            # Calculate n-step Q-Learning targets
+            multipliers = self.args.gamma ** np.arange(n_steps)
+            rewards_numpy = rewards.cpu().numpy()
+            discounted_reward_sums = np.apply_along_axis(
+                lambda m: np.convolve(np.pad(m, (0, n_steps - 1), mode='constant'), multipliers[::-1], mode='valid'), 1,
+                rewards_numpy)
+
+            rewards = th.from_numpy(discounted_reward_sums).float()
+            if self.args.device == 'cuda':
+                rewards = rewards.cuda()
+
+            # Mask out values first before shifting
+            # Target Q vals for last n - 1 steps are 0
+            padding = th.zeros(target_max_qvals.shape[0], n_steps - 1, 1, device=self.args.device)
+
+            target_max_qvals = th.cat((target_max_qvals, padding), 1)
+
+            target_mask = th.from_numpy(np.roll(mask.cpu().numpy(), -(n_steps - 1), 1)).cuda()
+            target_max_qvals *= target_mask
+            terminated = th.from_numpy(np.roll(terminated.cpu().numpy(), -(n_steps - 1), 1)).cuda()
+
+        # Calculate n-step Q-Learning targets
+        targets = rewards + self.args.gamma ** n_steps * (1 - terminated) * target_max_qvals
+        # targets = rewards + self.args.gamma * (1 - terminated) * target_max_qvals
 
         # Td-error
         td_error = (chosen_action_qvals - targets.detach())
@@ -94,13 +136,32 @@ class QLearner:
         masked_td_error = td_error * mask
 
         # Normal L2 loss, take mean over actual data
-        loss = (masked_td_error ** 2).sum() / mask.sum()
+        if self.args.loss == 'l2':
+            loss = (masked_td_error ** 2)
+        elif self.args.loss == 'huber':
+            loss = th.nn.SmoothL1Loss(reduction='none')(chosen_action_qvals * mask, targets.detach() * mask)
+        else:
+            raise ValueError("Unknown loss: {}".format(self.args.loss))
+
+        # Weight errors if using priority exp replay
+        if weights is not None:
+            loss = th.sum(loss, 1)
+            weights = th.from_numpy(weights).float()
+            if self.args.device == 'cuda':
+                weights = weights.cuda()
+            loss = loss.squeeze()
+            loss = loss * weights
+            loss = loss.sum() / mask.sum()
+        else:
+            loss = loss.sum() / mask.sum()
 
         # Optimise
         self.optimiser.zero_grad()
         loss.backward()
         grad_norm = th.nn.utils.clip_grad_norm_(self.params, self.args.grad_norm_clip)
         self.optimiser.step()
+        if self.args.use_decay:
+            self.scheduler.step()
 
         if (episode_num - self.last_target_update_episode) / self.args.target_update_interval >= 1.0:
             self._update_targets()
@@ -114,6 +175,8 @@ class QLearner:
             self.logger.log_stat("q_taken_mean", (chosen_action_qvals * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.log_stats_t = t_env
+
+        return masked_td_error
 
     def _update_targets(self):
         self.target_mac.load_state(self.mac)
