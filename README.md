@@ -1,5 +1,5 @@
 ## This repository is a fork of [pymarl](https://github.com/oxwhirl/pymarl) framework.
-
+### You can check out details of my implementation and results in [here](https://github.com/mahi97/XQMIX/blob/master/XQMIX.pdf).
 
 ```diff
 - Please pay attention to the version of SC2 you are using for your experiments. 
