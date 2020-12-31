@@ -1,6 +1,8 @@
 import torch as th
 import numpy as np
 from types import SimpleNamespace as SN
+from .segment_tree import SumSegmentTree, MinSegmentTree
+import random
 
 
 class EpisodeBatch:
@@ -72,7 +74,8 @@ class EpisodeBatch:
             if episode_const:
                 self.data.episode_data[field_key] = th.zeros((batch_size, *shape), dtype=dtype, device=self.device)
             else:
-                self.data.transition_data[field_key] = th.zeros((batch_size, max_seq_length, *shape), dtype=dtype, device=self.device)
+                self.data.transition_data[field_key] = th.zeros((batch_size, max_seq_length, *shape), dtype=dtype,
+                                                                device=self.device)
 
     def extend(self, scheme, groups=None):
         self._setup_data(scheme, self.groups if groups is None else groups, self.batch_size, self.max_seq_length)
@@ -142,7 +145,8 @@ class EpisodeBatch:
             new_scheme = {key: self.scheme[key] for key in item}
             new_groups = {self.scheme[key]["group"]: self.groups[self.scheme[key]["group"]]
                           for key in item if "group" in self.scheme[key]}
-            ret = EpisodeBatch(new_scheme, new_groups, self.batch_size, self.max_seq_length, data=new_data, device=self.device)
+            ret = EpisodeBatch(new_scheme, new_groups, self.batch_size, self.max_seq_length, data=new_data,
+                               device=self.device)
             return ret
         else:
             item = self._parse_slices(item)
@@ -163,7 +167,7 @@ class EpisodeBatch:
             return len(indexing_item)
         elif isinstance(indexing_item, slice):
             _range = indexing_item.indices(max_size)
-            return 1 + (_range[1] - _range[0] - 1)//_range[2]
+            return 1 + (_range[1] - _range[0] - 1) // _range[2]
 
     def _new_data_sn(self):
         new_data = SN()
@@ -175,9 +179,9 @@ class EpisodeBatch:
         parsed = []
         # Only batch slice given, add full time slice
         if (isinstance(items, slice)  # slice a:b
-            or isinstance(items, int)  # int i
-            or (isinstance(items, (list, np.ndarray, th.LongTensor, th.cuda.LongTensor)))  # [a,b,c]
-            ):
+                or isinstance(items, int)  # int i
+                or (isinstance(items, (list, np.ndarray, th.LongTensor, th.cuda.LongTensor)))  # [a,b,c]
+        ):
             items = (items, slice(None))
 
         # Need the time indexing to be contiguous
@@ -185,10 +189,10 @@ class EpisodeBatch:
             raise IndexError("Indexing across Time must be contiguous")
 
         for item in items:
-            #TODO: stronger checks to ensure only supported options get through
+            # TODO: stronger checks to ensure only supported options get through
             if isinstance(item, int):
                 # Convert single indices to slices
-                parsed.append(slice(item, item+1))
+                parsed.append(slice(item, item + 1))
             else:
                 # Leave slices and lists as is
                 parsed.append(item)
@@ -206,7 +210,8 @@ class EpisodeBatch:
 
 class ReplayBuffer(EpisodeBatch):
     def __init__(self, scheme, groups, buffer_size, max_seq_length, preprocess=None, device="cpu"):
-        super(ReplayBuffer, self).__init__(scheme, groups, buffer_size, max_seq_length, preprocess=preprocess, device=device)
+        super(ReplayBuffer, self).__init__(scheme, groups, buffer_size, max_seq_length, preprocess=preprocess,
+                                           device=device)
         self.buffer_size = buffer_size  # same as self.batch_size but more explicit
         self.buffer_index = 0
         self.episodes_in_buffer = 0
@@ -246,3 +251,102 @@ class ReplayBuffer(EpisodeBatch):
                                                                         self.scheme.keys(),
                                                                         self.groups.keys())
 
+
+# Adapted from the OpenAI Baseline implementations (https://github.com/openai/baselines)
+class PrioritizedReplayBuffer(ReplayBuffer):
+    def __init__(self, scheme, groups, buffer_size, max_seq_length, alpha, beta, t_max, preprocess=None, device="cpu"):
+        super(PrioritizedReplayBuffer, self).__init__(scheme, groups, buffer_size, max_seq_length,
+                                                      preprocess=preprocess, device="cpu")
+        self.alpha = alpha
+        self.beta_original = beta
+        self.beta = beta
+        self.beta_increment = (1.0 - beta) / t_max
+        self.max_priority = 1.0
+
+        ###
+        it_capacity = 1
+        while it_capacity < buffer_size:
+            it_capacity *= 2
+
+        self._it_sum = SumSegmentTree(it_capacity)
+        self._it_min = MinSegmentTree(it_capacity)
+        ###
+
+        # self.stat = np.zeros(500)
+
+    def insert_episode_batch(self, ep_batch):
+        # TODO: convert batch/episode to idx?
+        pre_idx = self.buffer_index
+        super().insert_episode_batch(ep_batch)
+        idx = self.buffer_index
+        if idx >= pre_idx:
+            for i in range(idx - pre_idx):
+                self._it_sum[pre_idx + i] = self.max_priority ** self.alpha
+                self._it_min[pre_idx + i] = self.max_priority ** self.alpha
+        else:
+            for i in range(self.buffer_size - pre_idx):
+                self._it_sum[pre_idx + i] = self.max_priority ** self.alpha
+                self._it_min[pre_idx + i] = self.max_priority ** self.alpha
+            for i in range(self.buffer_index):
+                self._it_sum[i] = self.max_priority ** self.alpha
+                self._it_min[i] = self.max_priority ** self.alpha
+
+    def _sample_proportional(self, batch_size):
+        res = []
+        p_total = self._it_sum.sum(0, self.episodes_in_buffer - 1)
+        every_range_len = p_total / batch_size
+        for i in range(batch_size):
+            mass = random.random() * every_range_len + i * every_range_len
+            idx = self._it_sum.find_prefixsum_idx(mass)
+            res.append(idx)
+        return res
+
+    def sample(self, batch_size, t):
+        assert self.can_sample(batch_size)
+        # print("------------ Beta: ", self.beta)
+        # print("------------ Episodes in buffer: ", self.episodes_in_buffer)
+        # print("------------ Buffer index: ", self.buffer_index)
+        # print("Stat:", self.stat[:100])
+        self.beta = self.beta_original + (t * self.beta_increment)
+
+        idxes = self._sample_proportional(batch_size)
+        # print("------------ IDXES:", idxes)
+
+        weights = []
+        p_min = self._it_min.min() / self._it_sum.sum()
+        max_weight = (p_min * self.episodes_in_buffer) ** (-self.beta)
+
+        for idx in idxes:
+            # self.stat[idx] += 1
+            p_sample = self._it_sum[idx] / self._it_sum.sum()
+            weight = (p_sample * self.episodes_in_buffer) ** (-self.beta)
+            weights.append(weight / max_weight)
+        weights = np.array(weights)
+        # encoded_sample = self._encode_sample(idxes)
+        # return tuple(list(encoded_sample) + [weights, idxes])
+
+        return self[idxes], idxes, weights
+
+    def update_priorities(self, idxes, priorities):
+        """Update priorities of sampled transitions.
+        sets priority of transition at index idxes[i] in buffer
+        to priorities[i].
+        Parameters
+        ----------
+        idxes: [int]
+            List of idxes of sampled transitions
+        priorities: [float]
+            List of updated priorities corresponding to
+            transitions at the sampled idxes denoted by
+            variable `idxes`.
+        """
+        assert len(idxes) == len(priorities)
+        priorities = np.sum(priorities, axis=1)[:, 0]
+
+        # print("------------- Priorities: ", priorities)
+        for idx, priority in zip(idxes, priorities):
+            assert priority > 0
+            assert 0 <= idx < self.episodes_in_buffer
+            self._it_sum[idx] = priority ** self.alpha
+            self._it_min[idx] = priority ** self.alpha
+            self.max_priority = max(self.max_priority, priority)
