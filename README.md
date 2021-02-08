@@ -1,3 +1,5 @@
+[![Hits](https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https%3A%2F%2Fgithub.com%2Fmahi97%2FXQMIX&count_bg=%2379C83D&title_bg=%23555555&icon=&icon_color=%23E7E7E7&title=hits&edge_flat=false)](https://hits.seeyoufarm.com)
+
 ## This repository is a fork of [pymarl](https://github.com/oxwhirl/pymarl) framework.
 ### You can check out details of my implementation and results in [here](https://github.com/mahi97/XQMIX/blob/master/XQMIX.pdf).
 
