@@ -12,8 +12,8 @@
 # Python MARL framework
 
 PyMARL is [WhiRL](http://whirl.cs.ox.ac.uk)'s framework for deep multi-agent reinforcement learning and includes implementations of the following algorithms:
-- [**XQMIX**: XQMIX: Extended QMix for StarCraft Multi-Agent Challenge](https://github.com/mahi97/XQMIX/blob/master/XQMIX.pdf)
-- [**QMIX**: QMIX: Monotonic Value Function Factorisation for Deep Multi-Agent Reinforcement Learning](https://arxiv.org/abs/1803.11485)
+- [**XQMIX**: Extended QMix for StarCraft Multi-Agent Challenge](https://github.com/mahi97/XQMIX/blob/master/XQMIX.pdf)
+- [**QMIX**: Monotonic Value Function Factorisation for Deep Multi-Agent Reinforcement Learning](https://arxiv.org/abs/1803.11485)
 - [**COMA**: Counterfactual Multi-Agent Policy Gradients](https://arxiv.org/abs/1705.08926)
 - [**VDN**: Value-Decomposition Networks For Cooperative Multi-Agent Learning](https://arxiv.org/abs/1706.05296) 
 - [**IQL**: Independent Q-Learning](https://arxiv.org/abs/1511.08779)
